@@ -13,6 +13,7 @@ import org.tron.p2p.base.Parameter;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.discover.message.Message;
 import org.tron.p2p.discover.message.kad.FindNodeMessage;
+import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
 import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
@@ -24,6 +25,7 @@ public class NodeHandler {
   @Setter
   @Getter
   private Node node;
+  private final InetSocketAddress endpoint;
   @Getter
   private volatile State state;
   private KadService kadService;
@@ -40,11 +42,18 @@ public class NodeHandler {
   private static int maxFindNodeFailures = 5;
 
   public NodeHandler(Node node, KadService kadService) {
+    this(node, kadService, node.getPreferInetSocketAddress());
+    if (endpoint != null) {
+      sendPing();
+    }
+  }
+
+  NodeHandler(Node node, KadService kadService, InetSocketAddress endpoint) {
     this.node = node;
     this.kadService = kadService;
-    // send ping only if IP stack is compatible
-    if (node.getPreferInetSocketAddress() != null) {
-      changeState(State.DISCOVERED);
+    this.endpoint = endpoint;
+    if (endpoint != null) {
+      state = State.DISCOVERED;
     }
   }
 
@@ -104,8 +113,13 @@ public class NodeHandler {
   }
 
   public void handlePing(PingMessage msg) {
+    handlePing(msg, endpoint);
+  }
+
+  void handlePing(PingMessage msg, InetSocketAddress sender) {
+    recordSender(msg);
     if (!kadService.getTable().getNode().equals(node)) {
-      sendPong();
+      sendPong(sender);
     }
     node.setNetworkId(msg.getNetworkId());
     if (!node.isConnectible(Parameter.p2pConfig.getNetworkId())) {
@@ -121,6 +135,7 @@ public class NodeHandler {
       if (!waitForPong) {
         return;
       }
+      recordSender(msg);
       waitForPong = false;
       cancelPongTimeout();
       node.setNetworkId(msg.getNetworkId());
@@ -137,6 +152,7 @@ public class NodeHandler {
       log.warn("Receive neighbors from {} without send find nodes", sender);
       return;
     }
+    recordSender(msg);
     findNodeFail = 0;
     waitForNeighbors = false;
     for (Node n : msg.getNodes()) {
@@ -147,8 +163,20 @@ public class NodeHandler {
   }
 
   public void handleFindNode(FindNodeMessage msg) {
+    handleFindNode(msg, endpoint);
+  }
+
+  void handleFindNode(FindNodeMessage msg, InetSocketAddress sender) {
+    recordSender(msg);
     List<Node> closest = kadService.getTable().getClosestNodes(msg.getTargetId());
-    sendNeighbours(closest, msg.getTimestamp());
+    sendNeighbours(closest, msg.getTimestamp(), sender);
+  }
+
+  private void recordSender(KadMessage msg) {
+    Node from = msg.getFrom();
+    node.setId(from.getId());
+    node.setBindPort(from.getPort());
+    node.touch();
   }
 
   public synchronized void handleTimedOut() {
@@ -171,7 +199,9 @@ public class NodeHandler {
     PingMessage msg = new PingMessage(kadService.getPublicHomeNode(), getNode());
     waitForPong = true;
     sendMessage(msg);
-
+    if (!waitForPong || sequence != pingSequence) {
+      return;
+    }
     try {
       pongTimeout = kadService.schedulePongTimeout(() -> {
         try {
@@ -199,8 +229,12 @@ public class NodeHandler {
   }
 
   public void sendPong() {
+    sendPong(endpoint);
+  }
+
+  private void sendPong(InetSocketAddress recipient) {
     Message pong = new PongMessage(kadService.getPublicHomeNode());
-    sendMessage(pong);
+    kadService.sendOutbound(new UdpEvent(pong, recipient));
   }
 
   public void sendFindNode(byte[] target) {
@@ -219,11 +253,15 @@ public class NodeHandler {
   }
 
   public void sendNeighbours(List<Node> neighbours, long sequence) {
+    sendNeighbours(neighbours, sequence, endpoint);
+  }
+
+  private void sendNeighbours(List<Node> neighbours, long sequence, InetSocketAddress recipient) {
     Node from = kadService.getPublicHomeNode();
     for (int size = neighbours.size(); size >= 0; size--) {
       Message msg = new NeighborsMessage(from, neighbours.subList(0, size), sequence);
       if (msg.getSendData().length < Constant.MAX_DISCOVERY_PACKET_SIZE) {
-        sendMessage(msg);
+        kadService.sendOutbound(new UdpEvent(msg, recipient));
         return;
       }
     }
@@ -231,7 +269,7 @@ public class NodeHandler {
   }
 
   private void sendMessage(Message msg) {
-    kadService.sendOutbound(new UdpEvent(msg, node.getPreferInetSocketAddress()));
+    kadService.sendOutbound(new UdpEvent(msg, endpoint));
   }
 
   @Override
