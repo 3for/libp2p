@@ -1,7 +1,7 @@
 package org.tron.p2p.discover.protocol.kad;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -36,7 +36,7 @@ public class DiscoverTask {
         } else {
           nodeId = NetUtil.getNodeId();
         }
-        discover(nodeId, 0, new ArrayList<>());
+        discover(nodeId);
       } catch (Exception e) {
         log.error("DiscoverTask fails to be executed", e);
       }
@@ -44,21 +44,30 @@ public class DiscoverTask {
     log.debug("DiscoverTask started");
   }
 
-  private void discover(byte[] nodeId, int round, List<Node> prevTriedNodes) {
+  void discover(byte[] targetId) {
+    discover(targetId, 0, new HashSet<>());
+  }
 
-    List<Node> closest = kadService.getTable().getClosestNodes(nodeId);
-    List<Node> tried = new ArrayList<>();
-    for (Node n : closest) {
-      if (!tried.contains(n) && !prevTriedNodes.contains(n)) {
-        try {
-          kadService.getNodeHandler(n).sendFindNode(nodeId);
-          tried.add(n);
-        } catch (Exception e) {
-          log.error("Unexpected Exception occurred while sending FindNodeMessage", e);
-        }
+  private void discover(byte[] targetId, int round, Set<String> queriedIds) {
+    Set<String> closestIds = new HashSet<>();
+    int sent = 0;
+    for (Node candidate : kadService.getTable().getNodesByDistance(targetId)) {
+      String id = candidate.getHexId();
+      // Limit the shortlist by ID while allowing another endpoint if a local send fails.
+      if (closestIds.size() < KademliaOptions.BUCKET_SIZE) {
+        closestIds.add(id);
       }
-
-      if (tried.size() == KademliaOptions.ALPHA) {
+      if (!closestIds.contains(id) || queriedIds.contains(id)) {
+        continue;
+      }
+      try {
+        kadService.getNodeHandler(candidate).sendFindNode(targetId);
+        queriedIds.add(id);
+        sent++;
+      } catch (Exception e) {
+        log.error("Unexpected Exception occurred while sending FindNodeMessage", e);
+      }
+      if (sent == KademliaOptions.ALPHA) {
         break;
       }
     }
@@ -70,15 +79,9 @@ public class DiscoverTask {
       Thread.currentThread().interrupt();
     }
 
-    if (tried.isEmpty()) {
-      return;
+    if (sent > 0 && round + 1 < KademliaOptions.MAX_STEPS) {
+      discover(targetId, round + 1, queriedIds);
     }
-
-    if (++round == KademliaOptions.MAX_STEPS) {
-      return;
-    }
-    tried.addAll(prevTriedNodes);
-    discover(nodeId, round, tried);
   }
 
   public void close() {

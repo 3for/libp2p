@@ -252,18 +252,7 @@ public class KadEndpointTest {
 
   @Test
   public void neighborsFillTheReplyWithDistinctPeersBeforeApplyingTheLimit() throws Exception {
-    service.getTable().addNode(peer.atEndpoint(V4));
-    service.getTable().addNode(peer.atEndpoint(V6));
-    Set<String> expectedIds = new HashSet<>();
-    expectedIds.add(peer.getHexId());
-    for (int i = 1; i < KademliaOptions.BUCKET_SIZE; i++) {
-      byte[] id = new byte[64];
-      id[0] = (byte) 0x80;
-      id[63] = (byte) i;
-      Node ipv4Only = new Node(id, "198.51.100." + i, null, 18888);
-      service.getTable().addNode(ipv4Only);
-      expectedIds.add(ipv4Only.getHexId());
-    }
+    Set<String> expectedIds = addDualStackPeerAndIpv4Neighbors();
     assertEquals(KademliaOptions.BUCKET_SIZE + 1, service.getTableNodes().size());
 
     List<Node> referrals = findNeighbors(new InetSocketAddress("2001:db8::3", 18888));
@@ -271,6 +260,42 @@ public class KadEndpointTest {
     assertEquals(expectedIds, referrals.stream().map(Node::getHexId).collect(Collectors.toSet()));
     assertArrayEquals(peer.getId(), referrals.get(0).getId());
     assertEquals(V6, referrals.get(0).getInetSocketAddressV6());
+  }
+
+  @Test
+  public void lookupQueriesTheClosestDistinctIdsOnceAcrossRounds() {
+    Set<String> expectedIds = addDualStackPeerAndIpv4Neighbors();
+    byte[] farId = new byte[64];
+    farId[0] = (byte) 0x80;
+    service.getTable().addNode(new Node(farId, "203.0.113.2", null, 18888));
+
+    runLookup();
+
+    List<String> queried = outbound.stream()
+        .filter(event -> event.getMessage().getType() == MessageType.KAD_FIND_NODE)
+        .map(event -> record(event.getAddress()).getHexId()).collect(Collectors.toList());
+    assertEquals(expectedIds.size(), queried.size());
+    assertEquals(expectedIds, new HashSet<>(queried));
+  }
+
+  @Test
+  public void lookupTriesTheOtherEndpointAfterALocalSendFailure() {
+    service.getTable().addNode(peer.atEndpoint(V4));
+    service.getTable().addNode(peer.atEndpoint(V6));
+    List<InetSocketAddress> attempts = new ArrayList<>();
+    service.setMessageSender(event -> {
+      if (event.getMessage().getType() == MessageType.KAD_FIND_NODE) {
+        attempts.add(event.getAddress());
+        if (attempts.size() == 1) {
+          throw new IllegalStateException("Simulated send failure");
+        }
+      }
+    });
+
+    runLookup();
+
+    assertEquals(2, attempts.size());
+    assertTrue(attempts.containsAll(Arrays.asList(V4, V6)));
   }
 
   @Test
@@ -297,6 +322,32 @@ public class KadEndpointTest {
     assertEquals(NodeHandler.State.ACTIVE, handler.getState());
     assertSame(handler.getNode(), record(V4));
     assertArrayEquals(peer.getId(), handler.getNode().getId());
+  }
+
+  private Set<String> addDualStackPeerAndIpv4Neighbors() {
+    service.getTable().addNode(peer.atEndpoint(V4));
+    service.getTable().addNode(peer.atEndpoint(V6));
+    Set<String> expectedIds = new HashSet<>();
+    expectedIds.add(peer.getHexId());
+    for (int i = 1; i < KademliaOptions.BUCKET_SIZE; i++) {
+      byte[] id = new byte[64];
+      id[0] = 0x40;
+      // Distinct binary IDs even when their last byte decodes to a replacement character.
+      id[63] = (byte) (0x80 + i);
+      Node ipv4Only = new Node(id, "198.51.100." + i, null, 18888);
+      service.getTable().addNode(ipv4Only);
+      expectedIds.add(ipv4Only.getHexId());
+    }
+    return expectedIds;
+  }
+
+  private void runLookup() {
+    DiscoverTask task = new DiscoverTask(service);
+    try {
+      task.discover(peer.getId());
+    } finally {
+      task.close();
+    }
   }
 
   private Node onlyReferral(InetSocketAddress source) throws Exception {

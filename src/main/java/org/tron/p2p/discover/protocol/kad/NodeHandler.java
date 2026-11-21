@@ -25,6 +25,7 @@ import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
 import org.tron.p2p.discover.protocol.kad.table.KademliaOptions;
 import org.tron.p2p.discover.socket.UdpEvent;
+import org.tron.p2p.utils.NetUtil;
 
 @Slf4j(topic = "net")
 public class NodeHandler {
@@ -281,6 +282,9 @@ public class NodeHandler {
     Function<Node, String> address = ipv4 ? Node::getHostV4 : Node::getHostV6;
     Map<String, Node> selected = new LinkedHashMap<>();
     for (Node candidate : candidates) {
+      if (!NetUtil.validNodeId(candidate.getId())) {
+        continue;
+      }
       String id = candidate.getHexId();
       Node current = selected.get(id);
       if (current == null) {

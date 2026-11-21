@@ -175,6 +175,30 @@ public class MessageHandlerTest {
   }
 
   @Test
+  public void invalidNodeIdsDoNotDisplaceValidNeighborsOrInvalidateTheReply() throws Exception {
+    startPipeline(new KadService());
+    List<Node> valid = neighbors("");
+    List<Node> candidates = new ArrayList<>();
+    for (byte[] id : new byte[][]{null, new byte[0], new byte[63], new byte[65]}) {
+      candidates.add(new Node(id, "192.0.2.4", null, 18888));
+    }
+    candidates.addAll(valid);
+    InetSocketAddress recipient = new InetSocketAddress("192.0.2.3", 18888);
+    NodeHandler handler = service.getNodeHandler(new Node(recipient));
+    outbound.clear();
+    handler.sendNeighbours(candidates, 1L);
+
+    Assert.assertEquals(1, outbound.size());
+    List<Object> decoded = decode(outbound.get(0).getMessage().getSendData());
+    Assert.assertEquals(1, decoded.size());
+    List<Node> returned = ((NeighborsMessage) ((UdpEvent) decoded.get(0)).getMessage()).getNodes();
+    Assert.assertEquals(valid.size(), returned.size());
+    for (int i = 0; i < valid.size(); i++) {
+      Assert.assertArrayEquals(valid.get(i).getId(), returned.get(i).getId());
+    }
+  }
+
+  @Test
   public void scopedIpv6NeighborsRequireValidIpv4() throws Exception {
     Node from = new Node(new byte[64], "192.0.2.1", null, 18888);
     for (String zone : new String[]{"2147483647", "eth0"}) {
