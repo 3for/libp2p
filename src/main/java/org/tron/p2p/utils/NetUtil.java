@@ -75,11 +75,12 @@ public class NetUtil {
     return port > 0 && port <= 0xFFFF;
   }
 
+  public static boolean validNodeId(byte[] id) {
+    return id != null && id.length == Constant.NODE_ID_LEN;
+  }
+
   public static boolean validNode(Node node) {
-    if (node == null || node.getId() == null) {
-      return false;
-    }
-    if (node.getId().length != Constant.NODE_ID_LEN || !validPort(node.getPort())) {
+    if (node == null || !validNodeId(node.getId()) || !validPort(node.getPort())) {
       return false;
     }
     if (StringUtils.isEmpty(node.getHostV4()) && StringUtils.isEmpty(node.getHostV6())) {

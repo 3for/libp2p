@@ -75,6 +75,13 @@ public class Node implements Serializable, Cloneable {
     formatHostV6();
   }
 
+  /** A discovery contact at a single UDP endpoint, retaining the advertised bind port. */
+  public Node atEndpoint(InetSocketAddress endpoint) {
+    String host = endpoint.getAddress().getHostAddress();
+    boolean ipv4 = endpoint.getAddress() instanceof Inet4Address;
+    return new Node(id, ipv4 ? host : null, ipv4 ? null : host, endpoint.getPort(), bindPort);
+  }
+
   public void updateHostV4(String hostV4) {
     if (StringUtils.isEmpty(this.hostV4) && StringUtils.isNotEmpty(hostV4)) {
       log.info("update hostV4:{} with hostV6:{}", hostV4, this.hostV6);

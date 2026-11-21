@@ -1,22 +1,31 @@
 package org.tron.p2p.discover.protocol.kad;
 
+import java.net.Inet4Address;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.tron.p2p.base.Constant;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.discover.message.Message;
 import org.tron.p2p.discover.message.kad.FindNodeMessage;
+import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
 import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
+import org.tron.p2p.discover.protocol.kad.table.KademliaOptions;
 import org.tron.p2p.discover.socket.UdpEvent;
+import org.tron.p2p.utils.NetUtil;
 
 @Slf4j(topic = "net")
 public class NodeHandler {
@@ -24,6 +33,7 @@ public class NodeHandler {
   @Setter
   @Getter
   private Node node;
+  private final InetSocketAddress endpoint;
   @Getter
   private volatile State state;
   private KadService kadService;
@@ -40,11 +50,18 @@ public class NodeHandler {
   private static int maxFindNodeFailures = 5;
 
   public NodeHandler(Node node, KadService kadService) {
+    this(node, kadService, node.getPreferInetSocketAddress());
+    if (endpoint != null) {
+      sendPing();
+    }
+  }
+
+  NodeHandler(Node node, KadService kadService, InetSocketAddress endpoint) {
     this.node = node;
     this.kadService = kadService;
-    // send ping only if IP stack is compatible
-    if (node.getPreferInetSocketAddress() != null) {
-      changeState(State.DISCOVERED);
+    this.endpoint = endpoint;
+    if (endpoint != null) {
+      state = State.DISCOVERED;
     }
   }
 
@@ -104,8 +121,13 @@ public class NodeHandler {
   }
 
   public void handlePing(PingMessage msg) {
+    handlePing(msg, endpoint);
+  }
+
+  void handlePing(PingMessage msg, InetSocketAddress sender) {
+    recordSender(msg);
     if (!kadService.getTable().getNode().equals(node)) {
-      sendPong();
+      sendPong(sender);
     }
     node.setNetworkId(msg.getNetworkId());
     if (!node.isConnectible(Parameter.p2pConfig.getNetworkId())) {
@@ -121,6 +143,7 @@ public class NodeHandler {
       if (!waitForPong) {
         return;
       }
+      recordSender(msg);
       waitForPong = false;
       cancelPongTimeout();
       node.setNetworkId(msg.getNetworkId());
@@ -137,6 +160,7 @@ public class NodeHandler {
       log.warn("Receive neighbors from {} without send find nodes", sender);
       return;
     }
+    recordSender(msg);
     findNodeFail = 0;
     waitForNeighbors = false;
     for (Node n : msg.getNodes()) {
@@ -147,8 +171,20 @@ public class NodeHandler {
   }
 
   public void handleFindNode(FindNodeMessage msg) {
-    List<Node> closest = kadService.getTable().getClosestNodes(msg.getTargetId());
-    sendNeighbours(closest, msg.getTimestamp());
+    handleFindNode(msg, endpoint);
+  }
+
+  void handleFindNode(FindNodeMessage msg, InetSocketAddress sender) {
+    recordSender(msg);
+    List<Node> closest = kadService.getTable().getNodesByDistance(msg.getTargetId());
+    sendNeighbours(closest, msg.getTimestamp(), sender);
+  }
+
+  private void recordSender(KadMessage msg) {
+    Node from = msg.getFrom();
+    node.setId(from.getId());
+    node.setBindPort(from.getPort());
+    node.touch();
   }
 
   public synchronized void handleTimedOut() {
@@ -168,10 +204,12 @@ public class NodeHandler {
   public synchronized void sendPing() {
     cancelPongTimeout();
     long sequence = ++pingSequence;
-    PingMessage msg = new PingMessage(kadService.getPublicHomeNode(), getNode());
+    PingMessage msg = new PingMessage(advertisedHomeNode(endpoint), getNode());
     waitForPong = true;
     sendMessage(msg);
-
+    if (!waitForPong || sequence != pingSequence) {
+      return;
+    }
     try {
       pongTimeout = kadService.schedulePongTimeout(() -> {
         try {
@@ -199,8 +237,12 @@ public class NodeHandler {
   }
 
   public void sendPong() {
-    Message pong = new PongMessage(kadService.getPublicHomeNode());
-    sendMessage(pong);
+    sendPong(endpoint);
+  }
+
+  private void sendPong(InetSocketAddress recipient) {
+    Message pong = new PongMessage(advertisedHomeNode(recipient));
+    kadService.sendOutbound(new UdpEvent(pong, recipient));
   }
 
   public void sendFindNode(byte[] target) {
@@ -214,24 +256,64 @@ public class NodeHandler {
       }
     }
     waitForNeighbors = true;
-    FindNodeMessage msg = new FindNodeMessage(kadService.getPublicHomeNode(), target);
+    FindNodeMessage msg = new FindNodeMessage(advertisedHomeNode(endpoint), target);
     sendMessage(msg);
   }
 
   public void sendNeighbours(List<Node> neighbours, long sequence) {
-    Node from = kadService.getPublicHomeNode();
-    for (int size = neighbours.size(); size >= 0; size--) {
-      Message msg = new NeighborsMessage(from, neighbours.subList(0, size), sequence);
+    sendNeighbours(neighbours, sequence, endpoint);
+  }
+
+  private void sendNeighbours(List<Node> neighbours, long sequence, InetSocketAddress recipient) {
+    List<Node> selected = selectNeighbours(neighbours, recipient);
+    Node from = advertisedHomeNode(recipient);
+    for (int size = selected.size(); size >= 0; size--) {
+      Message msg = new NeighborsMessage(from, selected.subList(0, size), sequence);
       if (msg.getSendData().length < Constant.MAX_DISCOVERY_PACKET_SIZE) {
-        sendMessage(msg);
+        kadService.sendOutbound(new UdpEvent(msg, recipient));
         return;
       }
     }
     log.warn("Skip neighbors response: sender endpoint exceeds discovery packet size limit");
   }
 
+  private List<Node> selectNeighbours(List<Node> candidates, InetSocketAddress recipient) {
+    boolean ipv4 = recipient != null && recipient.getAddress() instanceof Inet4Address;
+    Function<Node, String> address = ipv4 ? Node::getHostV4 : Node::getHostV6;
+    Map<String, Node> selected = new LinkedHashMap<>();
+    for (Node candidate : candidates) {
+      if (!NetUtil.validNodeId(candidate.getId())) {
+        continue;
+      }
+      String id = candidate.getHexId();
+      Node current = selected.get(id);
+      if (current == null) {
+        if (selected.size() < KademliaOptions.BUCKET_SIZE) {
+          selected.put(id, candidate);
+        }
+      } else if (StringUtils.isEmpty(address.apply(current))
+          && StringUtils.isNotEmpty(address.apply(candidate))) {
+        // A later endpoint can improve a selected referral without changing its position.
+        selected.put(id, candidate);
+      }
+    }
+    return new ArrayList<>(selected.values());
+  }
+
+  private Node advertisedHomeNode(InetSocketAddress recipient) {
+    Node home = kadService.getPublicHomeNode();
+    if (home.getHostV4() == null || home.getHostV6() == null
+        || recipient == null || recipient.isUnresolved()) {
+      return home;
+    }
+    // Legacy peers prefer the advertised IPv4 address even when replying to an IPv6 packet.
+    boolean ipv4 = recipient.getAddress() instanceof Inet4Address;
+    return new Node(home.getId(), ipv4 ? home.getHostV4() : null,
+        ipv4 ? null : home.getHostV6(), home.getPort());
+  }
+
   private void sendMessage(Message msg) {
-    kadService.sendOutbound(new UdpEvent(msg, node.getPreferInetSocketAddress()));
+    kadService.sendOutbound(new UdpEvent(msg, endpoint));
   }
 
   @Override

@@ -62,6 +62,7 @@ public class OutboundHandshakeTimeoutHandlerTest {
   private final List<EmbeddedChannel> sockets = new ArrayList<>();
   private final List<Channel> peers = new ArrayList<>();
   private final List<Node> candidates = new ArrayList<>();
+  private final List<Node> discoveryCandidates = new ArrayList<>();
   private final Map<String, Object> previousServices = new HashMap<>();
   private final AtomicInteger disconnectCallbacks = new AtomicInteger();
   private P2pConfig previousConfig;
@@ -109,7 +110,7 @@ public class OutboundHandshakeTimeoutHandlerTest {
     discovery.set(null, new KadService() {
       @Override
       public List<Node> getConnectableNodes() {
-        return new ArrayList<>();
+        return new ArrayList<>(discoveryCandidates);
       }
     });
     Parameter.handlerList.add(new P2pEventHandler() {
@@ -399,13 +400,7 @@ public class OutboundHandshakeTimeoutHandlerTest {
 
   @Test
   public void timeoutReleasesBudgetAndAllowsOrdinaryReplenishment() throws Exception {
-    field(ConnPoolService.class, "peerClient").set(pool, new PeerClient() {
-      @Override
-      public ChannelFuture connectAsync(Node node, boolean nodeDetectMode) {
-        return outbound(node.getPreferInetSocketAddress(), nodeDetectMode, true)
-            .newSucceededFuture();
-      }
-    });
+    useEmbeddedPeerClient();
     candidates.add(new Node(REMOTE));
     scan();
     Assert.assertEquals(1, sockets.size());
@@ -425,6 +420,31 @@ public class OutboundHandshakeTimeoutHandlerTest {
     Assert.assertEquals(2, sockets.size());
     Assert.assertTrue(sockets.get(1).isOpen());
     Assert.assertEquals(1, pool.getOrdinaryOutboundConnectionCount().get());
+  }
+
+  @Test
+  public void timedOutDiscoveryDialCanReachSamePeerOnItsOtherEndpoint() throws Exception {
+    useEmbeddedPeerClient();
+    Parameter.p2pConfig.setIpv6("2001:db8::1");
+    byte[] peerId = new byte[64];
+    peerId[0] = 1;
+    Node ipv4 = new Node(peerId, REMOTE.getHostString(), null, REMOTE.getPort());
+    Node ipv6 = new Node(peerId, null, "2001:db8::2", REMOTE.getPort());
+    field(Node.class, "updateTime").setLong(ipv4, 1L);
+    discoveryCandidates.add(ipv4);
+    discoveryCandidates.add(ipv6);
+
+    scan();
+    Assert.assertEquals(1, sockets.size());
+    Assert.assertEquals(ipv6.getInetSocketAddressV6(), sockets.get(0).remoteAddress());
+    advance(sockets.get(0), Parameter.HANDSHAKE_TIMEOUT_SECONDS);
+    drainPool();
+
+    Assert.assertFalse(sockets.get(0).isOpen());
+    Assert.assertEquals(2, sockets.size());
+    Assert.assertEquals(REMOTE, sockets.get(1).remoteAddress());
+    receive(sockets.get(1), hello());
+    Assert.assertTrue(peers.get(1).isRegisteredPeer());
   }
 
   @Test(timeout = 25000)
@@ -551,6 +571,16 @@ public class OutboundHandshakeTimeoutHandlerTest {
     } finally {
       bytes.release();
     }
+  }
+
+  private void useEmbeddedPeerClient() throws Exception {
+    field(ConnPoolService.class, "peerClient").set(pool, new PeerClient() {
+      @Override
+      public ChannelFuture connectAsync(Node node, boolean nodeDetectMode) {
+        return outbound(node.getPreferInetSocketAddress(), nodeDetectMode, true)
+            .newSucceededFuture();
+      }
+    });
   }
 
   private void scan() throws Exception {

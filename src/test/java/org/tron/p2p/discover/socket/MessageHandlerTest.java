@@ -148,6 +148,57 @@ public class MessageHandlerTest {
   }
 
   @Test
+  public void laterSameFamilyEndpointKeepsItsPeersPlaceInAFullReply() throws Exception {
+    config.setIpv6("2001:db8::1");
+    startPipeline(new KadService());
+    List<Node> candidates = neighbors("");
+    Node first = candidates.get(0);
+    Node alternate = new Node(first.getId().clone(), null, "2001:db8::2", first.getPort());
+    int uniquePeers = candidates.size();
+    candidates.add(alternate);
+    InetSocketAddress recipient = new InetSocketAddress("2001:db8::3", 18888);
+    NodeHandler handler = service.getNodeHandler(new Node(recipient));
+    outbound.clear();
+
+    handler.sendNeighbours(Collections.unmodifiableList(candidates), 1L);
+
+    Assert.assertEquals(1, outbound.size());
+    NeighborsMessage reply = (NeighborsMessage) Message.parse(
+        outbound.get(0).getMessage().getSendData());
+    List<Node> returned = reply.getNodes();
+    Assert.assertEquals(uniquePeers, returned.size());
+    Assert.assertEquals(alternate.getInetSocketAddressV6(),
+        returned.get(0).getInetSocketAddressV6());
+    for (int i = 0; i < returned.size(); i++) {
+      Assert.assertArrayEquals(candidates.get(i).getId(), returned.get(i).getId());
+    }
+  }
+
+  @Test
+  public void invalidNodeIdsDoNotDisplaceValidNeighborsOrInvalidateTheReply() throws Exception {
+    startPipeline(new KadService());
+    List<Node> valid = neighbors("");
+    List<Node> candidates = new ArrayList<>();
+    for (byte[] id : new byte[][]{null, new byte[0], new byte[63], new byte[65]}) {
+      candidates.add(new Node(id, "192.0.2.4", null, 18888));
+    }
+    candidates.addAll(valid);
+    InetSocketAddress recipient = new InetSocketAddress("192.0.2.3", 18888);
+    NodeHandler handler = service.getNodeHandler(new Node(recipient));
+    outbound.clear();
+    handler.sendNeighbours(candidates, 1L);
+
+    Assert.assertEquals(1, outbound.size());
+    List<Object> decoded = decode(outbound.get(0).getMessage().getSendData());
+    Assert.assertEquals(1, decoded.size());
+    List<Node> returned = ((NeighborsMessage) ((UdpEvent) decoded.get(0)).getMessage()).getNodes();
+    Assert.assertEquals(valid.size(), returned.size());
+    for (int i = 0; i < valid.size(); i++) {
+      Assert.assertArrayEquals(valid.get(i).getId(), returned.get(i).getId());
+    }
+  }
+
+  @Test
   public void scopedIpv6NeighborsRequireValidIpv4() throws Exception {
     Node from = new Node(new byte[64], "192.0.2.1", null, 18888);
     for (String zone : new String[]{"2147483647", "eth0"}) {
@@ -178,9 +229,8 @@ public class MessageHandlerTest {
 
   @Test
   public void neighborPacketLimitIsExclusive() throws Exception {
-    String ipv6 = "2001:db8:1234:5678:9abc:0:0:1";
-    config.setIp("192.168.100.200");
-    config.setIpv6(ipv6);
+    String ipv6 = "2001:db8:1234:5678:9abc:0:0:123";
+    config.setIp("192.168.10.200");
     startPipeline(new KadService());
     List<Node> neighbors = neighbors(ipv6);
 
@@ -195,7 +245,8 @@ public class MessageHandlerTest {
   }
 
   private void assertNeighborsFit(List<Node> neighbors, long sequence) throws Exception {
-    Node from = service.getPublicHomeNode();
+    Node home = service.getPublicHomeNode();
+    Node from = home.atEndpoint(home.getInetSocketAddressV4());
     byte[] original = new NeighborsMessage(from, neighbors, sequence).getSendData();
     NodeHandler handler = service.getNodeHandler(new Node(new byte[64], "127.0.0.2", null,
         18888));

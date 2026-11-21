@@ -1,6 +1,5 @@
 package org.tron.p2p.discover.protocol.kad;
 
-import java.net.Inet4Address;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -20,6 +19,7 @@ import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.discover.DiscoverService;
 import org.tron.p2p.discover.Node;
+import org.tron.p2p.discover.message.MessageType;
 import org.tron.p2p.discover.message.kad.FindNodeMessage;
 import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
@@ -134,36 +134,34 @@ public class KadService implements DiscoverService {
   @Override
   public void handleEvent(UdpEvent udpEvent) {
     KadMessage m = (KadMessage) udpEvent.getMessage();
-
     InetSocketAddress sender = udpEvent.getAddress();
-
-    Node n;
-    if (sender.getAddress() instanceof Inet4Address) {
-      n = new Node(m.getFrom().getId(), sender.getHostString(), m.getFrom().getHostV6(),
-          sender.getPort(), m.getFrom().getPort());
-    } else {
-      n = new Node(m.getFrom().getId(), m.getFrom().getHostV4(), sender.getHostString(),
-          sender.getPort(), m.getFrom().getPort());
+    if (sender == null || sender.isUnresolved()) {
+      return;
     }
-
-    if (n.getPreferInetSocketAddress() == null) {
+    NodeHandler nodeHandler = nodeHandlerMap.get(sender);
+    // A response belongs to an existing endpoint's probe; it cannot introduce a sender.
+    if (nodeHandler == null && m.getType() != MessageType.KAD_PING
+        && m.getType() != MessageType.KAD_FIND_NODE) {
+      return;
+    }
+    Node contact = nodeHandler == null ? m.getFrom().atEndpoint(sender) : nodeHandler.getNode();
+    if (contact.getPreferInetSocketAddress() == null) {
       log.debug("Drop discovery message from {}: no compatible reply address", sender);
       return;
     }
-
-    NodeHandler nodeHandler = getNodeHandler(n);
-    nodeHandler.getNode().setId(n.getId());
-    nodeHandler.getNode().touch();
+    if (nodeHandler == null) {
+      nodeHandler = getOrCreateHandler(sender, contact);
+    }
 
     switch (m.getType()) {
       case KAD_PING:
-        nodeHandler.handlePing((PingMessage) m);
+        nodeHandler.handlePing((PingMessage) m, sender);
         break;
       case KAD_PONG:
         nodeHandler.handlePong((PongMessage) m);
         break;
       case KAD_FIND_NODE:
-        nodeHandler.handleFindNode((FindNodeMessage) m);
+        nodeHandler.handleFindNode((FindNodeMessage) m, sender);
         break;
       case KAD_NEIGHBORS:
         nodeHandler.handleNeighbours((NeighborsMessage) m, sender);
@@ -174,27 +172,30 @@ public class KadService implements DiscoverService {
   }
 
   public NodeHandler getNodeHandler(Node n) {
-    NodeHandler ret = null;
-    InetSocketAddress inet4 = n.getInetSocketAddressV4();
-    InetSocketAddress inet6 = n.getInetSocketAddressV6();
-    if (inet4 != null) {
-      ret = nodeHandlerMap.get(inet4);
+    InetSocketAddress endpoint = n.getPreferInetSocketAddress();
+    if (endpoint == null) {
+      return new NodeHandler(n, this);
     }
-    if (ret == null && inet6 != null) {
-      ret = nodeHandlerMap.get(inet6);
-    }
+    // A neighbor advertisement supplies a candidate to probe, never an alias for another record.
+    NodeHandler existing = nodeHandlerMap.get(endpoint);
+    return existing != null ? existing : getOrCreateHandler(endpoint, n.atEndpoint(endpoint));
+  }
 
-    if (ret == null) {
-      trimTable();
-      ret = new NodeHandler(n, this);
-      if (n.getPreferInetSocketAddress() != null) {
-        nodeHandlerMap.put(n.getPreferInetSocketAddress(), ret);
-      }
-    } else {
-      ret.getNode().updateHostV4(n.getHostV4());
-      ret.getNode().updateHostV6(n.getHostV6());
+  private NodeHandler getOrCreateHandler(InetSocketAddress endpoint, Node contact) {
+    trimTable();
+    NodeHandler candidate = new NodeHandler(contact, this, endpoint);
+    NodeHandler existing = nodeHandlerMap.putIfAbsent(endpoint, candidate);
+    if (existing != null) {
+      return existing;
     }
-    return ret;
+    // Publish before sending the first ping so an immediate pong can find its pending probe.
+    try {
+      candidate.sendPing();
+    } catch (RuntimeException e) {
+      nodeHandlerMap.remove(endpoint, candidate);
+      throw e;
+    }
+    return candidate;
   }
 
   public Node getPublicHomeNode() {

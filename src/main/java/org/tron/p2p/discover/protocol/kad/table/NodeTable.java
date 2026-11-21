@@ -106,17 +106,22 @@ public class NodeTable {
     return false;
   }
 
-  public synchronized List<Node> getClosestNodes(byte[] targetId) {
-    List<NodeEntry> closestEntries = getAllNodes();
-    List<Node> closestNodes = new ArrayList<>();
-    for (NodeEntry e : closestEntries) {
-      closestNodes.add((Node) e.getNode().clone());
-    }
-    Collections.sort(closestNodes, new DistanceComparator(targetId));
+  public List<Node> getClosestNodes(byte[] targetId) {
+    List<Node> closestNodes = getNodesByDistance(targetId);
     if (closestNodes.size() > BUCKET_SIZE) {
-      closestNodes = closestNodes.subList(0, BUCKET_SIZE);
+      return closestNodes.subList(0, BUCKET_SIZE);
     }
     return closestNodes;
+  }
+
+  /** All endpoint records, ordered by distance before a caller applies its own result limit. */
+  public synchronized List<Node> getNodesByDistance(byte[] targetId) {
+    List<Node> sorted = new ArrayList<>(nodes.size());
+    for (NodeEntry entry : nodes.values()) {
+      sorted.add((Node) entry.getNode().clone());
+    }
+    Collections.sort(sorted, new DistanceComparator(targetId));
+    return sorted;
   }
 
   public synchronized List<Node> getTableNodes() {
