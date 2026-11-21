@@ -2,13 +2,18 @@ package org.tron.p2p.discover.protocol.kad;
 
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.tron.p2p.base.Constant;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.discover.Node;
@@ -18,6 +23,7 @@ import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
 import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
+import org.tron.p2p.discover.protocol.kad.table.KademliaOptions;
 import org.tron.p2p.discover.socket.UdpEvent;
 
 @Slf4j(topic = "net")
@@ -169,7 +175,7 @@ public class NodeHandler {
 
   void handleFindNode(FindNodeMessage msg, InetSocketAddress sender) {
     recordSender(msg);
-    List<Node> closest = kadService.getTable().getClosestNodes(msg.getTargetId());
+    List<Node> closest = kadService.getTable().getNodesByDistance(msg.getTargetId());
     sendNeighbours(closest, msg.getTimestamp(), sender);
   }
 
@@ -258,15 +264,36 @@ public class NodeHandler {
   }
 
   private void sendNeighbours(List<Node> neighbours, long sequence, InetSocketAddress recipient) {
+    List<Node> selected = selectNeighbours(neighbours, recipient);
     Node from = advertisedHomeNode(recipient);
-    for (int size = neighbours.size(); size >= 0; size--) {
-      Message msg = new NeighborsMessage(from, neighbours.subList(0, size), sequence);
+    for (int size = selected.size(); size >= 0; size--) {
+      Message msg = new NeighborsMessage(from, selected.subList(0, size), sequence);
       if (msg.getSendData().length < Constant.MAX_DISCOVERY_PACKET_SIZE) {
         kadService.sendOutbound(new UdpEvent(msg, recipient));
         return;
       }
     }
     log.warn("Skip neighbors response: sender endpoint exceeds discovery packet size limit");
+  }
+
+  private List<Node> selectNeighbours(List<Node> candidates, InetSocketAddress recipient) {
+    boolean ipv4 = recipient != null && recipient.getAddress() instanceof Inet4Address;
+    Function<Node, String> address = ipv4 ? Node::getHostV4 : Node::getHostV6;
+    Map<String, Node> selected = new LinkedHashMap<>();
+    for (Node candidate : candidates) {
+      String id = candidate.getHexId();
+      Node current = selected.get(id);
+      if (current == null) {
+        if (selected.size() < KademliaOptions.BUCKET_SIZE) {
+          selected.put(id, candidate);
+        }
+      } else if (StringUtils.isEmpty(address.apply(current))
+          && StringUtils.isNotEmpty(address.apply(candidate))) {
+        // A later endpoint can improve a selected referral without changing its position.
+        selected.put(id, candidate);
+      }
+    }
+    return new ArrayList<>(selected.values());
   }
 
   private Node advertisedHomeNode(InetSocketAddress recipient) {

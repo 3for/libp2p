@@ -12,7 +12,10 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -26,6 +29,7 @@ import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
 import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
+import org.tron.p2p.discover.protocol.kad.table.KademliaOptions;
 import org.tron.p2p.discover.socket.UdpEvent;
 
 public class KadEndpointTest {
@@ -212,6 +216,64 @@ public class KadEndpointTest {
   }
 
   @Test
+  public void pongFromAnotherKnownEndpointCannotCompletePendingProbe() {
+    NodeHandler ipv4 = service.getNodeHandler(peer.atEndpoint(V4));
+    NodeHandler ipv6 = service.getNodeHandler(peer.atEndpoint(V6));
+    service.handleEvent(new UdpEvent(new PongMessage(peer), V6));
+    assertEquals(NodeHandler.State.ACTIVE, ipv6.getState());
+    assertEquals(NodeHandler.State.DISCOVERED, ipv4.getState());
+
+    service.handleEvent(new UdpEvent(new PongMessage(peer), V4));
+    assertEquals(NodeHandler.State.ACTIVE, ipv4.getState());
+  }
+
+  @Test
+  public void neighborsReturnOneEndpointPerPeerMatchingTheRequestersFamily() throws Exception {
+    for (InetSocketAddress endpoint : Arrays.asList(V4, V6)) {
+      NodeHandler handler = service.getNodeHandler(peer.atEndpoint(endpoint));
+      service.handleEvent(new UdpEvent(new PongMessage(peer), endpoint));
+      assertEquals(NodeHandler.State.ACTIVE, handler.getState());
+    }
+    assertEquals(2, service.getAllNodes().size());
+    assertNull(record(V4).getHostV6());
+    assertNull(record(V6).getHostV4());
+
+    assertTrue(service.getTable().contains(record(V4)));
+    assertTrue(service.getTable().contains(record(V6)));
+
+    Node ipv4Referral = onlyReferral(new InetSocketAddress("192.0.2.3", 18888));
+    assertEquals(V4, ipv4Referral.getInetSocketAddressV4());
+    assertNull(ipv4Referral.getHostV6());
+    Node ipv6Referral = onlyReferral(new InetSocketAddress("2001:db8::3", 18888));
+    assertEquals(V6, ipv6Referral.getInetSocketAddressV6());
+    assertNull(ipv6Referral.getHostV4());
+    assertEquals(2, service.getTableNodes().size());
+  }
+
+  @Test
+  public void neighborsFillTheReplyWithDistinctPeersBeforeApplyingTheLimit() throws Exception {
+    service.getTable().addNode(peer.atEndpoint(V4));
+    service.getTable().addNode(peer.atEndpoint(V6));
+    Set<String> expectedIds = new HashSet<>();
+    expectedIds.add(peer.getHexId());
+    for (int i = 1; i < KademliaOptions.BUCKET_SIZE; i++) {
+      byte[] id = new byte[64];
+      id[0] = (byte) 0x80;
+      id[63] = (byte) i;
+      Node ipv4Only = new Node(id, "198.51.100." + i, null, 18888);
+      service.getTable().addNode(ipv4Only);
+      expectedIds.add(ipv4Only.getHexId());
+    }
+    assertEquals(KademliaOptions.BUCKET_SIZE + 1, service.getTableNodes().size());
+
+    List<Node> referrals = findNeighbors(new InetSocketAddress("2001:db8::3", 18888));
+    assertEquals(KademliaOptions.BUCKET_SIZE, referrals.size());
+    assertEquals(expectedIds, referrals.stream().map(Node::getHexId).collect(Collectors.toSet()));
+    assertArrayEquals(peer.getId(), referrals.get(0).getId());
+    assertEquals(V6, referrals.get(0).getInetSocketAddressV6());
+  }
+
+  @Test
   public void failedInitialProbeCanBeRetried() {
     service.setMessageSender(event -> {
       throw new IllegalStateException("Test sender unavailable");
@@ -235,6 +297,27 @@ public class KadEndpointTest {
     assertEquals(NodeHandler.State.ACTIVE, handler.getState());
     assertSame(handler.getNode(), record(V4));
     assertArrayEquals(peer.getId(), handler.getNode().getId());
+  }
+
+  private Node onlyReferral(InetSocketAddress source) throws Exception {
+    List<Node> referrals = findNeighbors(source);
+    assertEquals(1, referrals.size());
+    assertArrayEquals(peer.getId(), referrals.get(0).getId());
+    return referrals.get(0);
+  }
+
+  private List<Node> findNeighbors(InetSocketAddress source) throws Exception {
+    Node requester = new Node(source);
+    service.getNodeHandler(requester);
+    outbound.clear();
+    FindNodeMessage request = new FindNodeMessage(requester, peer.getId());
+    service.handleEvent(new UdpEvent(request, source));
+    assertEquals(1, outbound.size());
+    assertDestination(0, MessageType.KAD_NEIGHBORS, source);
+    NeighborsMessage reply = (NeighborsMessage) Message.parse(
+        outbound.get(0).getMessage().getSendData());
+    assertEquals(request.getTimestamp(), reply.getTimestamp());
+    return reply.getNodes();
   }
 
   private Node record(InetSocketAddress endpoint) {

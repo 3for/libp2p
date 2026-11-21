@@ -148,6 +148,33 @@ public class MessageHandlerTest {
   }
 
   @Test
+  public void laterSameFamilyEndpointKeepsItsPeersPlaceInAFullReply() throws Exception {
+    config.setIpv6("2001:db8::1");
+    startPipeline(new KadService());
+    List<Node> candidates = neighbors("");
+    Node first = candidates.get(0);
+    Node alternate = new Node(first.getId().clone(), null, "2001:db8::2", first.getPort());
+    int uniquePeers = candidates.size();
+    candidates.add(alternate);
+    InetSocketAddress recipient = new InetSocketAddress("2001:db8::3", 18888);
+    NodeHandler handler = service.getNodeHandler(new Node(recipient));
+    outbound.clear();
+
+    handler.sendNeighbours(Collections.unmodifiableList(candidates), 1L);
+
+    Assert.assertEquals(1, outbound.size());
+    NeighborsMessage reply = (NeighborsMessage) Message.parse(
+        outbound.get(0).getMessage().getSendData());
+    List<Node> returned = reply.getNodes();
+    Assert.assertEquals(uniquePeers, returned.size());
+    Assert.assertEquals(alternate.getInetSocketAddressV6(),
+        returned.get(0).getInetSocketAddressV6());
+    for (int i = 0; i < returned.size(); i++) {
+      Assert.assertArrayEquals(candidates.get(i).getId(), returned.get(i).getId());
+    }
+  }
+
+  @Test
   public void scopedIpv6NeighborsRequireValidIpv4() throws Exception {
     Node from = new Node(new byte[64], "192.0.2.1", null, 18888);
     for (String zone : new String[]{"2147483647", "eth0"}) {
