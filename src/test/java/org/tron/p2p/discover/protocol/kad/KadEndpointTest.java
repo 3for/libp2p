@@ -19,8 +19,10 @@ import org.junit.Test;
 import org.tron.p2p.P2pConfig;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.discover.Node;
+import org.tron.p2p.discover.message.Message;
 import org.tron.p2p.discover.message.MessageType;
 import org.tron.p2p.discover.message.kad.FindNodeMessage;
+import org.tron.p2p.discover.message.kad.KadMessage;
 import org.tron.p2p.discover.message.kad.NeighborsMessage;
 import org.tron.p2p.discover.message.kad.PingMessage;
 import org.tron.p2p.discover.message.kad.PongMessage;
@@ -82,6 +84,41 @@ public class KadEndpointTest {
     assertNull(record(V6).getHostV4());
     assertFalse(record(translated).isConnectible(Parameter.p2pConfig.getNetworkId()));
     assertTrue(record(V6).isConnectible(Parameter.p2pConfig.getNetworkId()));
+  }
+
+  @Test
+  public void allDiscoveryMessagesAdvertiseOnlyTheLocalAddressOfTheDestinationFamily()
+      throws Exception {
+    Node home = service.getPublicHomeNode();
+    InetSocketAddress localV4 = home.getInetSocketAddressV4();
+    InetSocketAddress localV6 = home.getInetSocketAddressV6();
+    service.getTable().addNode(peer);
+    for (InetSocketAddress remote : Arrays.asList(V4, V6)) {
+      outbound.clear();
+      NodeHandler handler = service.getNodeHandler(peer.atEndpoint(remote));
+      handler.sendFindNode(peer.getId());
+      service.handleEvent(new UdpEvent(new PingMessage(peer, home), remote));
+      service.handleEvent(new UdpEvent(new FindNodeMessage(peer, peer.getId()), remote));
+
+      assertEquals(4, outbound.size());
+      assertDestination(0, MessageType.KAD_PING, remote);
+      assertDestination(1, MessageType.KAD_FIND_NODE, remote);
+      assertDestination(2, MessageType.KAD_PONG, remote);
+      assertDestination(3, MessageType.KAD_NEIGHBORS, remote);
+      for (UdpEvent event : outbound) {
+        KadMessage wire = (KadMessage) Message.parse(event.getMessage().getSendData());
+        Node from = wire.getFrom();
+        assertArrayEquals(home.getId(), from.getId());
+        assertEquals(home.getPort(), from.getPort());
+        assertEquals(remote.equals(V4) ? localV4 : null, from.getInetSocketAddressV4());
+        assertEquals(remote.equals(V6) ? localV6 : null, from.getInetSocketAddressV6());
+      }
+      NeighborsMessage neighbors = (NeighborsMessage) outbound.get(3).getMessage();
+      assertEquals(1, neighbors.getNodes().size());
+      Node referral = neighbors.getNodes().get(0);
+      assertEquals(V4, referral.getInetSocketAddressV4());
+      assertEquals(V6, referral.getInetSocketAddressV6());
+    }
   }
 
   @Test

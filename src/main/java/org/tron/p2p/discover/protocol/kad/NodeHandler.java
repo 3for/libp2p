@@ -1,5 +1,6 @@
 package org.tron.p2p.discover.protocol.kad;
 
+import java.net.Inet4Address;
 import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.concurrent.RejectedExecutionException;
@@ -196,7 +197,7 @@ public class NodeHandler {
   public synchronized void sendPing() {
     cancelPongTimeout();
     long sequence = ++pingSequence;
-    PingMessage msg = new PingMessage(kadService.getPublicHomeNode(), getNode());
+    PingMessage msg = new PingMessage(advertisedHomeNode(endpoint), getNode());
     waitForPong = true;
     sendMessage(msg);
     if (!waitForPong || sequence != pingSequence) {
@@ -233,7 +234,7 @@ public class NodeHandler {
   }
 
   private void sendPong(InetSocketAddress recipient) {
-    Message pong = new PongMessage(kadService.getPublicHomeNode());
+    Message pong = new PongMessage(advertisedHomeNode(recipient));
     kadService.sendOutbound(new UdpEvent(pong, recipient));
   }
 
@@ -248,7 +249,7 @@ public class NodeHandler {
       }
     }
     waitForNeighbors = true;
-    FindNodeMessage msg = new FindNodeMessage(kadService.getPublicHomeNode(), target);
+    FindNodeMessage msg = new FindNodeMessage(advertisedHomeNode(endpoint), target);
     sendMessage(msg);
   }
 
@@ -257,7 +258,7 @@ public class NodeHandler {
   }
 
   private void sendNeighbours(List<Node> neighbours, long sequence, InetSocketAddress recipient) {
-    Node from = kadService.getPublicHomeNode();
+    Node from = advertisedHomeNode(recipient);
     for (int size = neighbours.size(); size >= 0; size--) {
       Message msg = new NeighborsMessage(from, neighbours.subList(0, size), sequence);
       if (msg.getSendData().length < Constant.MAX_DISCOVERY_PACKET_SIZE) {
@@ -266,6 +267,18 @@ public class NodeHandler {
       }
     }
     log.warn("Skip neighbors response: sender endpoint exceeds discovery packet size limit");
+  }
+
+  private Node advertisedHomeNode(InetSocketAddress recipient) {
+    Node home = kadService.getPublicHomeNode();
+    if (home.getHostV4() == null || home.getHostV6() == null
+        || recipient == null || recipient.isUnresolved()) {
+      return home;
+    }
+    // Legacy peers prefer the advertised IPv4 address even when replying to an IPv6 packet.
+    boolean ipv4 = recipient.getAddress() instanceof Inet4Address;
+    return new Node(home.getId(), ipv4 ? home.getHostV4() : null,
+        ipv4 ? null : home.getHostV6(), home.getPort());
   }
 
   private void sendMessage(Message msg) {

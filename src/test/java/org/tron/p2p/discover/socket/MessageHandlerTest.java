@@ -178,9 +178,8 @@ public class MessageHandlerTest {
 
   @Test
   public void neighborPacketLimitIsExclusive() throws Exception {
-    String ipv6 = "2001:db8:1234:5678:9abc:0:0:1";
-    config.setIp("192.168.100.200");
-    config.setIpv6(ipv6);
+    String ipv6 = "2001:db8:1234:5678:9abc:0:0:123";
+    config.setIp("192.168.10.200");
     startPipeline(new KadService());
     List<Node> neighbors = neighbors(ipv6);
 
@@ -195,7 +194,8 @@ public class MessageHandlerTest {
   }
 
   private void assertNeighborsFit(List<Node> neighbors, long sequence) throws Exception {
-    Node from = service.getPublicHomeNode();
+    Node home = service.getPublicHomeNode();
+    Node from = home.atEndpoint(home.getInetSocketAddressV4());
     byte[] original = new NeighborsMessage(from, neighbors, sequence).getSendData();
     NodeHandler handler = service.getNodeHandler(new Node(new byte[64], "127.0.0.2", null,
         18888));
