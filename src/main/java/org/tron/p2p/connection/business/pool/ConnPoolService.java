@@ -280,6 +280,12 @@ public class ConnPoolService extends P2pEventHandler {
     }
 
     filtered.sort(Comparator.comparingLong(node -> -node.getUpdateTime()));
+    // Keep the most recent eligible endpoint per peer before sampling the dial batch.
+    Set<String> seenNodeIds = new HashSet<>();
+    filtered.removeIf(node -> {
+      String id = node.getHexId();
+      return StringUtils.isNotEmpty(id) && !seenNodeIds.add(id);
+    });
     int candidateSize = Math.max(limit * 10, minCandidateSize);
     if (filtered.size() > candidateSize) {
       filtered = filtered.subList(0, candidateSize);

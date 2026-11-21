@@ -5,6 +5,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -291,6 +292,40 @@ public class ConnPoolServiceTest {
   }
 
   @Test
+  public void getNodes_selectsOneEligibleEndpointPerNodeId() throws Exception {
+    Parameter.p2pConfig.setIpv6("2001:db8::1");
+    Node ipv4 = new Node(REMOTE);
+    Node ipv6 = new Node(ipv4.getId().clone(), null, "2001:db8::2", REMOTE.getPort());
+    Node other = new Node(new InetSocketAddress("127.0.0.3", REMOTE.getPort()));
+    set(ipv4, "updateTime", 1L);
+    List<Node> candidates = Arrays.asList(ipv4, ipv6, other);
+
+    List<Node> selected = pool.getNodes(Collections.emptySet(), Collections.emptySet(),
+        candidates, 3);
+    Assert.assertEquals(2, selected.size());
+    Assert.assertTrue(selected.contains(other));
+    Assert.assertTrue(selected.stream()
+        .anyMatch(n -> ipv6.getInetSocketAddressV6().equals(n.getPreferInetSocketAddress())));
+
+    selected = pool.getNodes(Collections.emptySet(),
+        Collections.singleton(ipv6.getInetSocketAddressV6()), candidates, 3);
+    Assert.assertEquals(2, selected.size());
+    Assert.assertTrue(selected.stream()
+        .anyMatch(n -> REMOTE.equals(n.getPreferInetSocketAddress())));
+  }
+
+  @Test
+  public void getNodes_keepsDistinctEndpointsWithUnknownIds() {
+    List<Node> candidates = Arrays.asList(
+        new Node(null, "127.0.0.2", null, PORT),
+        new Node(null, "127.0.0.3", null, PORT),
+        new Node(new byte[0], "127.0.0.4", null, PORT),
+        new Node(new byte[0], "127.0.0.5", null, PORT));
+    Assert.assertEquals(4,
+        pool.getNodes(Collections.emptySet(), Collections.emptySet(), candidates, 4).size());
+  }
+
+  @Test
   public void getNodes_banNode() throws InterruptedException {
     InetSocketAddress inetSocketAddress = new InetSocketAddress(LOCAL_IP, 90);
     long banTime = 500L;
@@ -447,10 +482,10 @@ public class ConnPoolServiceTest {
     }
   }
 
-  private void set(Channel channel, String name, Object value) throws Exception {
-    Field field = Channel.class.getDeclaredField(name);
+  private void set(Object target, String name, Object value) throws Exception {
+    Field field = target.getClass().getDeclaredField(name);
     field.setAccessible(true);
-    field.set(channel, value);
+    field.set(target, value);
   }
 
   private void clearChannels() {

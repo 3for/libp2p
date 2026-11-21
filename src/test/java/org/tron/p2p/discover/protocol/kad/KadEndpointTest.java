@@ -87,6 +87,38 @@ public class KadEndpointTest {
   }
 
   @Test
+  public void ipv4PeerOnAnotherNetworkLeavesActiveIpv6PeerUnchanged() {
+    // The IPv4 peer advertises both addresses and belongs to a different network.
+    PingMessage ipv4Ping = new PingMessage(peer, service.getPublicHomeNode());
+    int localNetworkId = ipv4Ping.getNetworkId() + 1;
+    Parameter.p2pConfig.setNetworkId(localNetworkId);
+    byte[] ipv6Id = new byte[64];
+    ipv6Id[0] = 2;
+    Node ipv6Peer = new Node(ipv6Id, null, V6.getHostString(), V6.getPort());
+    NodeHandler established = service.getNodeHandler(ipv6Peer);
+    service.handleEvent(new UdpEvent(new PongMessage(ipv6Peer), V6));
+    assertEquals(NodeHandler.State.ACTIVE, established.getState());
+
+    service.handleEvent(new UdpEvent(ipv4Ping, V4));
+
+    Node ipv6Record = record(V6);
+    assertSame(established.getNode(), ipv6Record);
+    assertArrayEquals(ipv6Id, ipv6Record.getId());
+    assertNull(ipv6Record.getHostV4());
+    assertEquals(V6, ipv6Record.getInetSocketAddressV6());
+    assertTrue(ipv6Record.isConnectible(localNetworkId));
+    assertEquals(NodeHandler.State.ACTIVE, established.getState());
+
+    Node ipv4Record = record(V4);
+    assertArrayEquals(peer.getId(), ipv4Record.getId());
+    assertTrue("IPv4 record should retain the sender's network ID",
+        ipv4Record.isConnectible(ipv4Ping.getNetworkId()));
+    assertFalse(ipv4Record.isConnectible(localNetworkId));
+    assertEquals(NodeHandler.State.DEAD, service.getNodeHandler(ipv4Record).getState());
+    assertEquals(Collections.singletonList(ipv6Record), service.getConnectableNodes());
+  }
+
+  @Test
   public void allDiscoveryMessagesAdvertiseOnlyTheLocalAddressOfTheDestinationFamily()
       throws Exception {
     Node home = service.getPublicHomeNode();
