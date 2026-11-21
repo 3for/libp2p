@@ -14,6 +14,11 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -246,6 +251,100 @@ public class HandshakeAdmissionTest {
     assertRejected(channel);
     HelloMessage reply = (HelloMessage) Message.parse(readOutbound(channel));
     Assert.assertEquals(DisconnectCode.TOO_MANY_PEERS.getValue().intValue(), reply.getCode());
+  }
+
+  @Test
+  public void outboundHandshakeSharesIpQuotaWithInboundPeers() throws Exception {
+    receive(newChannel(false, 10001), hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 1));
+    events.clear();
+    TestChannel second = newChannel(true, 10002);
+    receive(second, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 2));
+    assertAdmitted(second);
+
+    events.clear();
+    TestChannel third = newChannel(true, 10003);
+    receive(third, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 3));
+    assertRejected(third);
+    Assert.assertEquals(2, ChannelManager.getChannelCount());
+  }
+
+  @Test
+  public void concurrentOutboundHandshakesShareTheLastIpSlot() throws Exception {
+    config.setMaxConnectionsWithSameIp(1);
+    TestChannel first = newChannel(true, 10001);
+    TestChannel second = newChannel(true, 10002);
+    ExecutorService workers = Executors.newFixedThreadPool(2);
+    CyclicBarrier ready = new CyclicBarrier(2);
+    List<Future<?>> results = new ArrayList<>();
+    try {
+      for (TestChannel channel : Arrays.asList(first, second)) {
+        byte[] message = hello(NETWORK_ID, 1, DisconnectCode.NORMAL, channel == first ? 1 : 2);
+        results.add(workers.submit(() -> {
+          ready.await(5, TimeUnit.SECONDS);
+          receive(channel, message);
+          return null;
+        }));
+      }
+      for (Future<?> result : results) {
+        result.get(10, TimeUnit.SECONDS);
+      }
+      Assert.assertEquals(1, ChannelManager.getChannelCount());
+      Assert.assertNotEquals(first.isRegisteredPeer(), second.isRegisteredPeer());
+      Assert.assertTrue((first.isRegisteredPeer() ? second : first).isDisconnect());
+    } finally {
+      workers.shutdownNow();
+    }
+  }
+
+  @Test
+  public void outboundIpExemptionsUseTrustedIpOrExactConfiguredEndpoint() throws Exception {
+    config.setMaxConnectionsWithSameIp(0);
+    // The configured hostname has already resolved to the numeric IP used by the socket.
+    InetAddress resolved = InetAddress.getByAddress("active.example", new byte[]{127, 0, 0, 1});
+    InetSocketAddress active = new InetSocketAddress(resolved, 10001);
+    config.getActiveNodes().add(active);
+    try {
+      TestChannel otherPort = newChannel(true, 10002);
+      receive(otherPort, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 1));
+      assertRejected(otherPort);
+      TestChannel inbound = newChannel(false, active.getPort());
+      receive(inbound, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 2));
+      assertRejected(inbound);
+      TestChannel configured = newChannel(true, active.getPort());
+      receive(configured, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 3));
+      assertAdmitted(configured);
+
+      events.clear();
+      config.getTrustNodes().add(active.getAddress());
+      TestChannel trusted = newChannel(true, 10003);
+      receive(trusted, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 4));
+      assertAdmitted(trusted);
+    } finally {
+      config.getActiveNodes().remove(active);
+    }
+  }
+
+  @Test
+  public void outboundHandshakeUsesActiveEndpointsAtHelloTime() throws Exception {
+    config.setMaxConnectionsWithSameIp(0);
+    InetSocketAddress removed = new InetSocketAddress("127.0.0.1", 10001);
+    InetSocketAddress added = new InetSocketAddress("127.0.0.1", 10002);
+    List<InetSocketAddress> active = config.getActiveNodes();
+    active.add(removed);
+    try {
+      TestChannel formerlyActive = newChannel(true, removed.getPort());
+      TestChannel newlyActive = newChannel(true, added.getPort());
+      active.remove(removed);
+      active.add(added);
+
+      receive(formerlyActive, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 1));
+      assertRejected(formerlyActive);
+      receive(newlyActive, hello(NETWORK_ID, 1, DisconnectCode.NORMAL, 2));
+      assertAdmitted(newlyActive);
+    } finally {
+      active.remove(removed);
+      active.remove(added);
+    }
   }
 
   @Test

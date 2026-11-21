@@ -1,5 +1,6 @@
 package org.tron.p2p.connection;
 
+import com.google.common.cache.Cache;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
@@ -11,8 +12,11 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -28,6 +32,12 @@ import org.tron.p2p.connection.business.detect.NodeDetectService;
 import org.tron.p2p.connection.business.pool.ConnPoolService;
 import org.tron.p2p.connection.socket.PeerClient;
 import org.tron.p2p.discover.Node;
+import org.tron.p2p.discover.NodeManager;
+import org.tron.p2p.discover.protocol.kad.KadService;
+import org.tron.p2p.dns.DnsManager;
+import org.tron.p2p.dns.DnsNode;
+import org.tron.p2p.dns.sync.Client;
+import org.tron.p2p.dns.tree.Tree;
 
 public class ConnPoolConnectionTargetTest {
 
@@ -160,6 +170,91 @@ public class ConnPoolConnectionTargetTest {
     }
     scan(false);
     Assert.assertEquals(8, dials.size());
+  }
+
+  @Test
+  public void detectedCandidatesShareQuotaAcrossPortsAndFillFromOtherIps() throws Exception {
+    Parameter.p2pConfig.setMinConnections(3);
+    Parameter.p2pConfig.setMaxConnectionsWithSameIp(2);
+    candidates.clear();
+    for (int port = 18888; port < 18892; port++) {
+      candidates.add(new Node(new InetSocketAddress("192.0.2.1", port)));
+    }
+    InetSocketAddress otherIp = new InetSocketAddress("192.0.2.2", 18888);
+    candidates.add(new Node(otherIp));
+    startPool(0);
+
+    scan(false);
+
+    Assert.assertEquals(3, dialedAddresses.size());
+    Assert.assertTrue(dialedAddresses.contains(otherIp));
+  }
+
+  @Test
+  public void detectionDiscoveryAndDnsShareOneDialBudgetPerIp() throws Exception {
+    String sharedIp = "192.0.2.1";
+    InetSocketAddress otherDns = new InetSocketAddress("192.0.2.3", 18888);
+    Parameter.p2pConfig.setMinConnections(5);
+    Parameter.p2pConfig.setMaxConnectionsWithSameIp(2);
+    Parameter.p2pConfig.getTreeUrls().add("test");
+    candidates.clear();
+    candidates.add(new Node(new InetSocketAddress(sharedIp, 10001)));
+    startPool(0);
+
+    KadService discovery = new KadService() {
+      @Override
+      public List<Node> getConnectableNodes() {
+        return Arrays.asList(new Node(new InetSocketAddress(sharedIp, 10002)),
+            new Node(new InetSocketAddress(sharedIp, 10003)),
+            new Node(new InetSocketAddress("192.0.2.2", 18888)));
+      }
+    };
+    List<DnsNode> dnsNodes = Arrays.asList(new DnsNode(null, sharedIp, null, 10004),
+        new DnsNode(null, otherDns.getHostString(), null, otherDns.getPort()));
+    Client dns = new Client();
+    dns.getTrees().put("test", new Tree() {
+      @Override
+      public List<DnsNode> getDnsNodes() {
+        return dnsNodes;
+      }
+    });
+    Object oldDiscovery = setStatic(NodeManager.class, "discoverService", discovery);
+    Object oldClient = setStatic(DnsManager.class, "syncClient", dns);
+    Object oldLocalIps = setStatic(DnsManager.class, "localIpSet", Collections.emptySet());
+    try {
+      scan(false);
+      Assert.assertEquals(4, dialedAddresses.size());
+      Assert.assertEquals(2, dialedAddresses.stream()
+          .filter(address -> sharedIp.equals(address.getHostString())).count());
+      Assert.assertTrue(dialedAddresses.contains(otherDns));
+    } finally {
+      setStatic(NodeManager.class, "discoverService", oldDiscovery);
+      setStatic(DnsManager.class, "syncClient", oldClient);
+      setStatic(DnsManager.class, "localIpSet", oldLocalIps);
+      dns.close();
+    }
+  }
+
+  @Test
+  public void pendingDialReservesIpUntilSocketCloses() throws Exception {
+    Parameter.p2pConfig.setMaxConnectionsWithSameIp(1);
+    Parameter.p2pConfig.setMinConnections(1);
+    Parameter.p2pConfig.setMinActiveConnections(0);
+    startPool(0);
+    scan(false);
+    InetSocketAddress address = dialedAddresses.get(0);
+    Node otherPort = new Node(new InetSocketAddress(address.getAddress(), address.getPort() + 1));
+    // Exercise the socket reservation independently of the retry cooldown.
+    Field cache = ConnPoolService.class.getDeclaredField("peerClientCache");
+    cache.setAccessible(true);
+    ((Cache<?, ?>) cache.get(pool)).invalidateAll();
+
+    dials.get(0).setSuccess();
+    Assert.assertTrue(pool.getNodes(new HashSet<>(), new HashSet<>(),
+        Collections.singletonList(otherPort), 1).isEmpty());
+    dials.get(0).channel().close().syncUninterruptibly();
+    Assert.assertEquals(Collections.singletonList(otherPort), pool.getNodes(
+        new HashSet<>(), new HashSet<>(), Collections.singletonList(otherPort), 1));
   }
 
   @Test
@@ -403,9 +498,11 @@ public class ConnPoolConnectionTargetTest {
     return (Collection<Channel>) field.get(null);
   }
 
-  private void setStatic(Class<?> type, String name, Object value) throws Exception {
+  private Object setStatic(Class<?> type, String name, Object value) throws Exception {
     Field field = type.getDeclaredField(name);
     field.setAccessible(true);
+    Object previous = field.get(null);
     field.set(null, value);
+    return previous;
   }
 }

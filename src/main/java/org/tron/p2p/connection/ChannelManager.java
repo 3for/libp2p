@@ -178,12 +178,15 @@ public class ChannelManager {
         log.info("Too many peers, disconnected with {}", channel);
         return DisconnectCode.TOO_MANY_PEERS;
       }
+    }
 
-      int num = getConnectionNum(channel.getInetAddress());
-      if (num >= Parameter.p2pConfig.getMaxConnectionsWithSameIp()) {
-        log.info("Max connection with same ip {}", channel);
-        return DisconnectCode.MAX_CONNECTION_WITH_SAME_IP;
-      }
+    boolean configuredOutbound = channel.isOutbound()
+        && Parameter.p2pConfig.getActiveNodes().contains(channel.getInetSocketAddress());
+    int ipLimit = Parameter.p2pConfig.getMaxConnectionsWithSameIp();
+    if (!channel.isTrustPeer() && !configuredOutbound
+        && getConnectionNum(channel.getInetAddress()) >= ipLimit) {
+      log.info("Max connection with same ip {}", channel);
+      return DisconnectCode.MAX_CONNECTION_WITH_SAME_IP;
     }
 
     if (StringUtils.isNotEmpty(channel.getNodeId())) {

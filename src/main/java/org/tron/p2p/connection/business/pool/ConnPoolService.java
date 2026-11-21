@@ -9,8 +9,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,10 +50,9 @@ public class ConnPoolService extends P2pEventHandler {
   // Incoming and outgoing channels can then share a remote address; track instances separately.
   // Includes registered inbound and outbound peers, including configured active nodes.
   private final List<Channel> registeredPeers = Collections.synchronizedList(new ArrayList<>());
-  // Ordinary outbound sockets awaiting P2P handshake completion; excludes startup-configured nodes.
-  // Reserve minConnections budget until onConnect or socket close, even after TCP connects.
-  private final Set<io.netty.channel.Channel> pendingOrdinaryOutboundConnections =
-      ConcurrentHashMap.newKeySet();
+  // Keep the dial target even before TCP connects and the socket has a remote address.
+  private final Map<io.netty.channel.Channel, InetSocketAddress> pendingOutboundConnections =
+      new ConcurrentHashMap<>();
   private final Cache<InetAddress, Long> peerClientCache = CacheBuilder.newBuilder()
       .maximumSize(1000).expireAfterWrite(120, TimeUnit.SECONDS).recordStats().build();
 
@@ -76,7 +77,7 @@ public class ConnPoolService extends P2pEventHandler {
   private PeerClient peerClient;
 
   // Snapshot of active nodes configured when this pool is created.
-  private final List<InetSocketAddress> configActiveNodes = new ArrayList<>();
+  private final Set<InetSocketAddress> configActiveNodes = new HashSet<>();
   private int minCandidateSize = 50;
 
   /** @deprecated Use {@link #getInboundPeerCount()}. */
@@ -191,11 +192,13 @@ public class ConnPoolService extends P2pEventHandler {
     int totalLackSize = p2pConfig.getMinConnections() - getTotalConnectionCount();
     int size = Math.max(0, Math.max(totalLackSize, activeLackSize));
     int lackSize = size;
+    Map<InetAddress, Integer> ipUsage = lackSize > 0 ? getIpUsage() : Collections.emptyMap();
     if (lackSize > 0) {
       List<Node> connectableNodes = ChannelManager.getNodeDetectService().getConnectableNodes();
       for (Node node : connectableNodes) {
         // nodesInUse and inetInUse don't change in method `validNode`
-        if (validNode(node, nodesInUse, inetInUse, null)) {
+        if (validNode(node, nodesInUse, inetInUse, null, ipUsage)) {
+          countSelectedIp(ipUsage, node);
           connectNodes.add(node);
           nodesInUse.add(node.getHexId());
           inetInUse.add(node.getPreferInetSocketAddress());
@@ -210,9 +213,10 @@ public class ConnPoolService extends P2pEventHandler {
     if (lackSize > 0) {
       List<Node> connectableNodes = NodeManager.getConnectableNodes();
       // nodesInUse and inetInUse don't change in method `getNodes`
-      List<Node> newNodes = getNodes(nodesInUse, inetInUse, connectableNodes, lackSize);
+      List<Node> newNodes = getNodes(nodesInUse, inetInUse, connectableNodes, lackSize, ipUsage);
       connectNodes.addAll(newNodes);
       for (Node node : newNodes) {
+        countSelectedIp(ipUsage, node);
         nodesInUse.add(node.getHexId());
         inetInUse.add(node.getPreferInetSocketAddress());
       }
@@ -221,19 +225,21 @@ public class ConnPoolService extends P2pEventHandler {
 
     if (lackSize > 0 && !p2pConfig.getTreeUrls().isEmpty()) {
       List<DnsNode> dnsNodes = DnsManager.getDnsNodes();
-      List<DnsNode> filtered = new ArrayList<>();
       Collections.shuffle(dnsNodes);
       for (DnsNode node : dnsNodes) {
-        if (validNode(node, nodesInUse, inetInUse, null)) {
+        if (validNode(node, nodesInUse, inetInUse, null, ipUsage)) {
           DnsNode copyNode = (DnsNode) node.clone();
           copyNode.setId(NetUtil.getNodeId());
           //for node1 {ipv4_1, ipv6}, node2 {ipv4_2, ipv6}, we will not connect it twice
           addNode(inetInUse, node);
-          filtered.add(copyNode);
+          countSelectedIp(ipUsage, node);
+          connectNodes.add(copyNode);
+          lackSize--;
+          if (lackSize == 0) {
+            break;
+          }
         }
       }
-      List<DnsNode> newNodes = CollectionUtils.truncate(filtered, lackSize);
-      connectNodes.addAll(newNodes);
     }
 
     log.debug("Connection replenishment: ordinary outbound deficit {}, selected nodes {}, "
@@ -244,42 +250,79 @@ public class ConnPoolService extends P2pEventHandler {
   }
 
   private void connect(Node node) {
-    log.info("Connect to peer {}", node.getPreferInetSocketAddress());
-    peerClientCache.put(node.getPreferInetSocketAddress().getAddress(), System.currentTimeMillis());
+    InetSocketAddress address = node.getPreferInetSocketAddress();
+    log.info("Connect to peer {}", address);
+    peerClientCache.put(address.getAddress(), System.currentTimeMillis());
     ChannelFuture future = peerClient.connectAsync(node, false);
-    if (!configActiveNodes.contains(node.getPreferInetSocketAddress())) {
-      if (future != null) {
-        trackConnection(future);
-      }
+    if (future != null) {
+      trackConnection(future, address);
+    }
+    if (!configActiveNodes.contains(address)) {
       ordinaryOutboundConnectionCount.incrementAndGet();
     }
   }
 
   private synchronized int getTotalConnectionCount() {
-    return registeredPeers.size() + pendingOrdinaryOutboundConnections.size();
+    int count = registeredPeers.size();
+    for (InetSocketAddress address : pendingOutboundConnections.values()) {
+      if (!configActiveNodes.contains(address)) {
+        count++;
+      }
+    }
+    return count;
   }
 
-  private synchronized void trackConnection(ChannelFuture future) {
+  private synchronized void trackConnection(ChannelFuture future, InetSocketAddress address) {
     io.netty.channel.Channel socket = future.channel();
     // The handshake may already have completed before connectAsync returns.
     if (registeredPeers.stream().noneMatch(peer -> peer.getCtx().channel() == socket)) {
-      pendingOrdinaryOutboundConnections.add(socket);
+      pendingOutboundConnections.put(socket, address);
     }
-    socket.closeFuture().addListener(closed -> pendingOrdinaryOutboundConnections.remove(socket));
+    socket.closeFuture().addListener(closed -> pendingOutboundConnections.remove(socket));
+  }
+
+  private synchronized Map<InetAddress, Integer> getIpUsage() {
+    Map<InetAddress, Integer> usage = new HashMap<>();
+    Map<io.netty.channel.Channel, InetSocketAddress> pending =
+        new HashMap<>(pendingOutboundConnections);
+    for (Channel peer : ChannelManager.getAllChannels()) {
+      usage.merge(peer.getInetAddress(), 1, Integer::sum);
+      // Registration precedes onConnect, so the socket may still have a pending reservation.
+      if (peer.getCtx() != null) {
+        pending.remove(peer.getCtx().channel());
+      }
+    }
+    for (InetSocketAddress address : pending.values()) {
+      usage.merge(address.getAddress(), 1, Integer::sum);
+    }
+    return usage;
+  }
+
+  private int countSelectedIp(Map<InetAddress, Integer> usage, Node node) {
+    return usage.merge(node.getPreferInetSocketAddress().getAddress(), 1, Integer::sum);
   }
 
   public List<Node> getNodes(Set<String> nodesInUse, Set<InetSocketAddress> inetInUse,
       List<Node> connectableNodes, int limit) {
+    return getNodes(nodesInUse, inetInUse, connectableNodes, limit, getIpUsage());
+  }
+
+  private List<Node> getNodes(Set<String> nodesInUse, Set<InetSocketAddress> inetInUse,
+      List<Node> connectableNodes, int limit, Map<InetAddress, Integer> ipUsage) {
     List<Node> filtered = new ArrayList<>();
     Set<InetSocketAddress> dynamicInetInUse = new HashSet<>(inetInUse);
     for (Node node : connectableNodes) {
-      if (validNode(node, nodesInUse, inetInUse, dynamicInetInUse)) {
+      if (validNode(node, nodesInUse, inetInUse, dynamicInetInUse, ipUsage)) {
         filtered.add((Node) node.clone());
         addNode(dynamicInetInUse, node);
       }
     }
 
     filtered.sort(Comparator.comparingLong(node -> -node.getUpdateTime()));
+    // Apply the quota before truncation so a crowded IP cannot hide other eligible peers.
+    Map<InetAddress, Integer> shortlistUsage = new HashMap<>(ipUsage);
+    filtered.removeIf(node -> countSelectedIp(shortlistUsage, node)
+        > p2pConfig.getMaxConnectionsWithSameIp());
     int candidateSize = Math.max(limit * 10, minCandidateSize);
     if (filtered.size() > candidateSize) {
       filtered = filtered.subList(0, candidateSize);
@@ -289,7 +332,7 @@ public class ConnPoolService extends P2pEventHandler {
   }
 
   private boolean validNode(Node node, Set<String> nodesInUse, Set<InetSocketAddress> inetInUse,
-      Set<InetSocketAddress> dynamicInet) {
+      Set<InetSocketAddress> dynamicInet, Map<InetAddress, Integer> ipUsage) {
     if (node == null || !NetUtil.validPort(node.getPort())) {
       return false;
     }
@@ -301,8 +344,7 @@ public class ConnPoolService extends P2pEventHandler {
     InetAddress inetAddress = inetSocketAddress.getAddress();
     Long forbiddenTime = ChannelManager.getBannedNodes().getIfPresent(inetAddress);
     if ((forbiddenTime != null && now <= forbiddenTime)
-        || (ChannelManager.getConnectionNum(inetAddress)
-        >= p2pConfig.getMaxConnectionsWithSameIp())
+        || ipUsage.getOrDefault(inetAddress, 0) >= p2pConfig.getMaxConnectionsWithSameIp()
         || (node.getId() != null && nodesInUse.contains(node.getHexId()))
         || (peerClientCache.getIfPresent(inetAddress) != null)
         || inetInUse.contains(inetSocketAddress)
@@ -374,7 +416,9 @@ public class ConnPoolService extends P2pEventHandler {
   @Override
   public synchronized void onConnect(Channel peer) {
     // Move the same socket from pending to established without counting it twice.
-    pendingOrdinaryOutboundConnections.removeIf(socket -> socket == peer.getCtx().channel());
+    if (peer.getCtx() != null) {
+      pendingOutboundConnections.remove(peer.getCtx().channel());
+    }
     // Channel.equals() compares remote addresses; membership must compare channel instances.
     if (registeredPeers.stream().noneMatch(channel -> channel == peer)) {
       if (!peer.isOutbound()) {
